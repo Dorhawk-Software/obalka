@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Advisories are published against code that has not changed, and this project can go a week
+  # without a push. Without a clock, `audit:shipped` only ever answers "was anything wrong at the
+  # moment somebody happened to commit?".
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+# One run per branch, and a newer push cancels the older run rather than racing it. `main` here keeps a
+# single commit that is rebuilt and force-pushed (2026-09-16), so every change supersedes the run before
+# it - four iOS builds of nearly the same tree once queued against each other for the macOS runners, each
+# slowing the others down, and only the last one's answer was worth having. `head_ref` groups a pull
+# request by its own branch, so a PR cancels only its own previous run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Lint
+        run: npm run lint
+      - name: Test
+        run: npm test
+      # Fails when a dependency was added, removed or bumped without regenerating the in-app licence
+      # list. Left unchecked the Licence screen goes quietly wrong, which is the failure that let two
+      # OFL-1.1 typefaces ship with no notice at all.
+      - name: Attributions up to date
+        run: npm run attributions:check
+      # Dependency advisories, filtered to the packages that actually reach a phone. A plain
+      # `npm audit` fails on Metro and the RN CLI, which never ship - and a gate everyone learns to
+      # ignore protects nothing. Depends on the step above: the shipped list is what it filters by,
+      # so a stale list would silently narrow what this checks.
+      - name: Audit shipped dependencies
+        run: npm run audit:shipped
+      # The hardcoded-colour guard has existed since 009 and was never run by anything - a screen that
+      # hardcodes a hex is a screen that ignores one of the two themes, which is how dark mode rots.
+      - name: Colours come from theme tokens
+        run: npm run check:colors
+
+  # A credential committed by accident, which is the one security failure in this repository that no
+  # dependency audit can see. `audit:shipped` reads a lockfile; it has nothing to say about a token
+  # pasted into a file.
+  #
+  # Scoped to SECRETS on purpose, not vulnerabilities. Trivy's dependency scanning would only find
+  # `package-lock.json` here - there is no committed `Podfile.lock` or Gradle lockfile - and that is
+  # already covered by `audit:shipped`, which additionally triages each advisory against what really
+  # ships. Two scanners disagreeing about the same lockfile is how a red build becomes background
+  # noise.
+  #
+  # The rules live in `.trivy-secret.yaml` because the built-ins do not know this project's actual
+  # credential: verified against a planted org auth token, Trivy's stock rules scanned it and said
+  # nothing. The exceptions live in `.trivyignore.yaml`, each naming a file and a reason.
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # Passed as an ENV VAR, not as a `with:` input: the action has no `secret-config` input, and
+      # giving it one is accepted silently. Measured, because that failure is invisible: with the
+      # custom rules loaded a planted org auth token is found; without them the same file scans
+      # clean and the job goes green having checked nothing.
+      TRIVY_SECRET_CONFIG: .trivy-secret.yaml
+    steps:
+      - uses: actions/checkout@v7
+
+      # Proves the rules above are actually loaded, before trusting a clean result from the real
+      # scan. A secret scanner that silently lost its config looks exactly like a repository with no
+      # secrets in it, and this is the only difference a build can see.
+      - name: The scanner can still see a secret
+        run: |
+          mkdir -p "$RUNNER_TEMP/canary"
+          printf 'auth.token=sntrys_%s\n' 'eyJpYXQiOjE3MDAwMDAwMDB9=_NOTAREALTOKEN000000' \
+            > "$RUNNER_TEMP/canary/sentry.properties"
+          curl -sSL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b "$RUNNER_TEMP/bin" v0.74.0 >/dev/null 2>&1
+          if "$RUNNER_TEMP/bin/trivy" fs --scanners secret --quiet --exit-code 1 \
+               "$RUNNER_TEMP/canary" >/dev/null 2>&1; then
+            echo "::error::The secret scanner did NOT flag a planted Sentry token. Its custom rules are not being loaded, so a clean result from the next step would mean nothing."
+            exit 1
+          fi
+          echo "Canary flagged as expected; the rules are live."
+          rm -rf "$RUNNER_TEMP/canary"
+
+      - name: No credentials in the tree
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          trivyignores: .trivyignore.yaml
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          skip-dirs: node_modules
+
+  # iOS was never built by anything until 2026-09-16. The repository was private, so macOS minutes
+  # were not free, and the only iOS workflow builds an unsigned IPA by hand. Everything the Linux
+  # jobs above check - types, lint, tests - passes with an iOS side that does not compile at all: a
+  # native module with no iOS half, a Podfile that will not resolve, an API that exists only on
+  # Android. This job asks the one question they cannot.
+  #
+  # Debug, for the DEVICE sdk, unsigned, with no Sentry upload and no archive: the answer wanted here is
+  # whether the app and its pods build, not whether they can be shipped. Signing and dSYM upload belong
+  # to `ios-sideload.yml`, which is still run by hand.
+  #
+  # Not the simulator, which is what this job tried first: react-native-vision-camera 5.2.3 names the RAW
+  # Bayer pixel formats (`kCVPixelFormatType_96VersatileBayerPacked12`, `kCVPixelFormatType_16VersatileBayer`)
+  # in `CMFormatDescription.MediaSubType+hidden.swift`, and those constants do not exist in the simulator
+  # SDK - there is no camera there to produce them. The build spent twenty minutes compiling everything
+  # else before failing on that one file. The device SDK has them, and it is also what the app actually
+  # ships against.
+  ios:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      # Xcode 26, not the runner's default 16.4. react-native-vision-camera 5.2.3 names
+      # `kCVPixelFormatType_96VersatileBayerPacked12`, a CoreVideo constant that exists only from the
+      # iOS 26 SDK on: probed on this image 2026-09-16, every Xcode 16.x SDK has zero hits for it and
+      # every 26.x has one. Without this the build compiles for twenty minutes and then fails on that
+      # one file. `macos-15` ships 26.0 through 26.3 beside the default; pinned rather than "latest" so
+      # a runner-image refresh cannot move the SDK under the build without a commit saying so.
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: CocoaPods
+        working-directory: ios
+        env:
+          RCT_NEW_ARCH_ENABLED: '1' # matches android/gradle.properties (newArchEnabled=true)
+        run: pod install --repo-update
+      - name: Build (device SDK, Debug, unsigned)
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace ObalkaDatovaSchranka.xcworkspace \
+            -scheme ObalkaDatovaSchranka \
+            -configuration Debug \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
